@@ -1,7 +1,8 @@
 ﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.database import engine
 from sqlalchemy import text
+from app.core.database import engine, Base
+from app.models.ticket import Ticket
 
 app = FastAPI(title="Campus Clinic Queue Tracker API")
 
@@ -12,6 +13,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def create_tables():
+    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")
