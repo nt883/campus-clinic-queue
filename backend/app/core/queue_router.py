@@ -1,18 +1,18 @@
 import uuid
 from datetime import datetime
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
 from app.core.connection_manager import manager
 from app.core.wait_estimator import estimate_wait_minutes
+from app.core.auth import verify_supabase_token, get_role_for_email
 from app.models.ticket import Ticket
 
 router = APIRouter()
 
 
 def serialize_queue(db: Session, service_type: str):
-    """Build the current waiting queue for a service type, with computed positions and wait times."""
     waiting_tickets = (
         db.query(Ticket)
         .filter(Ticket.service_type == service_type, Ticket.status == "waiting")
@@ -43,11 +43,23 @@ async def broadcast_queue_update(db: Session, queue_id: str):
 
 
 @router.websocket("/ws/queue/{queue_id}")
-async def queue_socket(websocket: WebSocket, queue_id: str):
-    await manager.connect(queue_id, websocket)
-    db = SessionLocal()
+async def queue_socket(websocket: WebSocket, queue_id: str, token: str = Query(...)):
     try:
-        # Send current state only to the newly-connected client, not everyone
+        user_data = await verify_supabase_token(token)
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
+    email = user_data.get("email")
+    if not email:
+        await websocket.close(code=4401)
+        return
+
+    db = SessionLocal()
+    role = get_role_for_email(db, email)
+
+    await manager.connect(queue_id, websocket)
+    try:
         queue = serialize_queue(db, queue_id)
         await manager.send_personal(websocket, {
             "type": "queue_update",
@@ -61,7 +73,7 @@ async def queue_socket(websocket: WebSocket, queue_id: str):
             if msg_type == "join_queue":
                 ticket = Ticket(
                     id=uuid.uuid4(),
-                    student_id=data["student_id"],
+                    student_id=email,
                     service_type=queue_id,
                     status="waiting",
                     joined_at=datetime.utcnow(),
@@ -73,7 +85,7 @@ async def queue_socket(websocket: WebSocket, queue_id: str):
             elif msg_type == "leave_queue":
                 ticket = (
                     db.query(Ticket)
-                    .filter(Ticket.student_id == data["student_id"], Ticket.status == "waiting")
+                    .filter(Ticket.student_id == email, Ticket.status == "waiting")
                     .first()
                 )
                 if ticket:
@@ -81,53 +93,61 @@ async def queue_socket(websocket: WebSocket, queue_id: str):
                     db.commit()
                 await broadcast_queue_update(db, queue_id)
 
-            elif msg_type == "call_next":
-                next_ticket = (
-                    db.query(Ticket)
-                    .filter(Ticket.service_type == queue_id, Ticket.status == "waiting")
-                    .order_by(Ticket.joined_at.asc())
-                    .first()
-                )
-                if next_ticket:
-                    next_ticket.status = "called"
-                    next_ticket.called_at = datetime.utcnow()
-                    db.commit()
-                    await manager.broadcast(queue_id, {
-                        "type": "your_turn",
-                        "ticket_id": str(next_ticket.id),
-                    })
-                    await broadcast_queue_update(db, queue_id)
-                else:
+            elif msg_type in ("call_next", "mark_complete", "mark_no_show"):
+                if role != "staff":
                     await manager.send_personal(websocket, {
                         "type": "error",
-                        "message": "No one waiting in this queue",
+                        "message": "Only staff can perform this action",
                     })
+                    continue
 
-            elif msg_type == "mark_complete":
-                ticket = db.query(Ticket).filter(Ticket.id == data["ticket_id"]).first()
-                if ticket:
-                    ticket.status = "completed"
-                    if not ticket.called_at:
-                        ticket.called_at = datetime.utcnow()
-                    db.commit()
-                    await broadcast_queue_update(db, queue_id)
-                else:
-                    await manager.send_personal(websocket, {
-                        "type": "error",
-                        "message": "Ticket not found",
-                    })
+                if msg_type == "call_next":
+                    next_ticket = (
+                        db.query(Ticket)
+                        .filter(Ticket.service_type == queue_id, Ticket.status == "waiting")
+                        .order_by(Ticket.joined_at.asc())
+                        .first()
+                    )
+                    if next_ticket:
+                        next_ticket.status = "called"
+                        next_ticket.called_at = datetime.utcnow()
+                        db.commit()
+                        await manager.broadcast(queue_id, {
+                            "type": "your_turn",
+                            "ticket_id": str(next_ticket.id),
+                        })
+                        await broadcast_queue_update(db, queue_id)
+                    else:
+                        await manager.send_personal(websocket, {
+                            "type": "error",
+                            "message": "No one waiting in this queue",
+                        })
 
-            elif msg_type == "mark_no_show":
-                ticket = db.query(Ticket).filter(Ticket.id == data["ticket_id"]).first()
-                if ticket:
-                    ticket.status = "no_show"
-                    db.commit()
-                    await broadcast_queue_update(db, queue_id)
-                else:
-                    await manager.send_personal(websocket, {
-                        "type": "error",
-                        "message": "Ticket not found",
-                    })
+                elif msg_type == "mark_complete":
+                    ticket = db.query(Ticket).filter(Ticket.id == data["ticket_id"]).first()
+                    if ticket:
+                        ticket.status = "completed"
+                        if not ticket.called_at:
+                            ticket.called_at = datetime.utcnow()
+                        db.commit()
+                        await broadcast_queue_update(db, queue_id)
+                    else:
+                        await manager.send_personal(websocket, {
+                            "type": "error",
+                            "message": "Ticket not found",
+                        })
+
+                elif msg_type == "mark_no_show":
+                    ticket = db.query(Ticket).filter(Ticket.id == data["ticket_id"]).first()
+                    if ticket:
+                        ticket.status = "no_show"
+                        db.commit()
+                        await broadcast_queue_update(db, queue_id)
+                    else:
+                        await manager.send_personal(websocket, {
+                            "type": "error",
+                            "message": "Ticket not found",
+                        })
 
             else:
                 await manager.send_personal(websocket, {
