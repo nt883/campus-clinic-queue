@@ -1,9 +1,10 @@
 ﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.core.database import engine
+from sqlalchemy import text
 
 app = FastAPI(title="Campus Clinic Queue Tracker API")
 
-# TODO: lock this down to the deployed frontend origin before demoing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,3 +17,10 @@ app.add_middleware(
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/health/db")
+def health_check_db():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"status": "database connected"}
